@@ -34,10 +34,10 @@ func mergedUsrSystem() (bool, error) {
 // Parse modinfo output and return the value of module attributes
 // There may be multiple row with same fieldname so []string
 // is used to return all data.
-func getModData(modname string, fieldname string, kernelRelease string) ([]string, error) {
-	out, err := exec.Command("modinfo", "-k", kernelRelease, modname).Output()
+func getModData(modpath string, fieldname string) ([]string, error) {
+	out, err := exec.Command("modinfo", modpath).Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to call modinfo for module %q and kernel release %q: %w", modname, kernelRelease, err)
+		return nil, fmt.Errorf("failed to call modinfo for module %q: %w", modpath, err)
 	}
 
 	var fieldValue []string
@@ -50,34 +50,137 @@ func getModData(modname string, fieldname string, kernelRelease string) ([]strin
 		}
 		name, value, ok := strings.Cut(line, ":")
 		if !ok {
-			return nil, fmt.Errorf("unexpected modinfo output for module %q: %q", modname, line)
+			return nil, fmt.Errorf("unexpected modinfo output for module %q: %q", modpath, line)
 		}
 		if strings.TrimSpace(name) == fieldname {
 			fieldValue = append(fieldValue, strings.TrimSpace(value))
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("failed to scan modinfo output for module %q: %w", modname, err)
+		return nil, fmt.Errorf("failed to scan modinfo output for module %q: %w", modpath, err)
 	}
 	return fieldValue, nil
 }
 
-// Get full path of module
-func getModPath(modname string, kernelRelease string) (string, error) {
-	path, err := getModData(modname, "filename", kernelRelease)
-	if err != nil {
-		return "", err
+// Normalizes a module name similar to modinfo's `module_normalize()` function.
+// See: https://github.com/kmod-project/kmod/blob/master/shared/util.c
+func normalizeModuleName(modname string) string {
+	// Replace all '-' with '_' and stop at first '.'
+	var b strings.Builder
+	for _, r := range modname {
+		switch r {
+		case '-':
+			b.WriteRune('_')
+		case '.':
+			return b.String()
+		default:
+			b.WriteRune(r)
+		}
 	}
-	if len(path) == 0 {
-		return "", fmt.Errorf("could not find path for module %q", modname)
+	return b.String()
+}
+
+// Given a path to a kernel module, extract the module's name by trimming the
+// directory and standard .ko suffixes.
+func moduleNameFromPath(modpath string) string {
+	base := filepath.Base(modpath)
+
+	suffixes := []string {
+		".ko", ".ko.gz", ".ko.xz", ".ko.zst",
 	}
 
-	return path[0], nil
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(base, suffix) {
+			return strings.TrimSuffix(base, suffix)
+		}
+	}
+
+	return base
+}
+
+// Scan either a modules.builtin or modules.dep file for the path to a module
+// given by it's name. If depFormat is true, then the file is expected to be
+// in the format of a modules.dep file, otherwise one path per line.
+// Returns the path to the module, whether the module was found, and any error.
+func scanModPathFile(filename string, modname string, depFormat bool) (string, bool, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		// If the file doesn't exist, return no error, since e.g. modules.builtin
+		// might not exist on all systems.
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("failed to open file %s: %w", filename, err)
+	}
+	defer file.Close()
+
+	want := normalizeModuleName(modname)
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		modPath := line
+
+		// In *.dep files, the path is followed by a colon.
+		if depFormat {
+			beforeColon, _, found := strings.Cut(modPath, ":")
+			if !found {
+				continue
+			}
+			modPath = strings.TrimSpace(beforeColon)
+		}
+
+		got := normalizeModuleName(moduleNameFromPath(modPath))
+		if got == want {
+			// Found the module we're looking for.
+			return modPath, true, nil
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", false, err
+	}
+
+	return "", false, nil
+}
+
+// Get the path to a kernel module file by it's name in a given module directory.
+func getModPath(modname string, moduleDir string) (string, bool, error) {
+	// Check loadable modules from modules.dep
+	path, found, err := scanModPathFile(filepath.Join(moduleDir, "modules.dep"), modname, true)
+	if err != nil {
+		return "", false, err
+	} else if found {
+		return filepath.Join(moduleDir, path), false, nil
+	}
+
+	// Check builtin modules from modules.builtin.
+	path, found, err = scanModPathFile(filepath.Join(moduleDir, "modules.builtin"), modname, false)
+	if err != nil {
+		return "", false, err
+	} else if found {
+		return filepath.Join(moduleDir, path), true, nil
+	}
+
+	return "", false, fmt.Errorf("module %q not found in %s", modname, moduleDir)
 }
 
 // Get all dependent module
-func getModDepends(modname string, kernelRelease string) ([]string, error) {
-	deplist, err := getModData(modname, "depends", kernelRelease)
+func getModDepends(modname string, moddir string) ([]string, error) {
+	modpath, isBuiltin, err := getModPath(modname, moddir)
+	if err != nil {
+		return nil, err
+	} else if isBuiltin {
+		// Builtin modules don't have dependencies, since the dependencies are
+		// compiled into the kernel itself.
+		return nil, nil
+	}
+	
+	deplist, err := getModData(modpath, "depends")
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +196,7 @@ func getModDepends(modname string, kernelRelease string) ([]string, error) {
 	// https://github.com/mirror/busybox/blob/1dd2685dcc735496d7adde87ac60b9434ed4a04c/modutils/modprobe.c#L46-L49
 	var sublist []string
 	for _, mod := range modlist {
-		deps, err := getModDepends(mod, kernelRelease)
+		deps, err := getModDepends(mod, moddir)
 		if err != nil {
 			return nil, fmt.Errorf("get dependencies for module %q: %w", mod, err)
 		}
@@ -112,17 +215,17 @@ var suffixes = map[string]writerhelper.Transformer{
 	".ko.zst": ZstdDecompressor,
 }
 
-func (m *Machine) copyModules(w *writerhelper.WriterHelper, modname string, copiedModules map[string]bool) error {
-	release, err := m.backend.KernelRelease()
+func (m *Machine) copyModules(w *writerhelper.WriterHelper, tgt_moddir string, modname string, copiedModules map[string]bool) error {
+	moddir, err := m.backend.ModulePath()
 	if err != nil {
-		return fmt.Errorf("failed to get kernel release: %w", err)
+		return fmt.Errorf("failed to get module path from backend: %w", err)
 	}
-	modpath, err := getModPath(modname, release)
+	modpath, isBuiltin, err := getModPath(modname, moddir)
 	if err != nil {
-		return fmt.Errorf("kernel module %q not found for kernel release %q: %w", modname, release, err)
+		return fmt.Errorf("kernel module %q not found in module directory %q: %w", modname, moddir, err)
 	}
 
-	if modpath == "(builtin)" || copiedModules[modname] {
+	if isBuiltin || copiedModules[modname] {
 		return nil
 	}
 
@@ -133,15 +236,17 @@ func (m *Machine) copyModules(w *writerhelper.WriterHelper, modname string, copi
 				return fmt.Errorf("failed to stat module file %q: %w", modpath, err)
 			}
 
+			// Get the relative path of the module to the source module directory,
+			// and construct a destination path with the target moddir.
+			relPath, err := filepath.Rel(moddir, modpath)
+			if err != nil {
+				return fmt.Errorf("failed to get relative path for module %q: %w", modpath, err)
+			}
+			dest := filepath.Join(tgt_moddir, relPath)
+
 			// The suffix is the complete thing - ".ko.foobar"
 			// Reinstate the required ".ko" part, after trimming.
-			dest := strings.TrimSuffix(modpath, suffix) + ".ko"
-
-			// Ensure destination has /usr prefix if running
-			// on merged-usr system.
-			if m.mergedUsr && !strings.HasPrefix(dest, "/usr") {
-				dest = "/usr" + dest
-			}
+			dest = strings.TrimSuffix(dest, suffix) + ".ko"
 
 			if err := w.TransformFileTo(modpath, dest, fn); err != nil {
 				return fmt.Errorf("failed to transform module file %q: %w", modpath, err)
@@ -156,12 +261,12 @@ func (m *Machine) copyModules(w *writerhelper.WriterHelper, modname string, copi
 
 	copiedModules[modname] = true
 
-	deplist, err := getModDepends(modname, release)
+	deplist, err := getModDepends(modname, moddir)
 	if err != nil {
 		return fmt.Errorf("failed to get dependencies for kernel module %q: %w", modname, err)
 	}
 	for _, mod := range deplist {
-		if err := m.copyModules(w, mod, copiedModules); err != nil {
+		if err := m.copyModules(w, tgt_moddir, mod, copiedModules); err != nil {
 			return err
 		}
 	}
@@ -270,6 +375,8 @@ type Machine struct {
 	scratchfile string
 	scratchdev  string
 	initrdpath  string
+
+	busyboxPath *string
 }
 
 // Create a new machine object with the auto backend
@@ -607,6 +714,37 @@ func (m *Machine) SetScratch(scratchsize int64, path string) {
 	m.scratchpath = path
 }
 
+// SetBackendOption sets a backend-specific option, identified by it's key and
+// the given string value. The supported options depend on the backend used,
+// an error is returned in case the option is invalid.
+func (m *Machine) SetBackendOption(key string, value string) error {
+	if m.backend == nil {
+		return fmt.Errorf("backend not set")
+	}
+	return m.backend.SetOption(key, value)
+}
+
+// SetBackendOptions sets multiple backend-specific options; see SetBackendOption.
+func (m *Machine) SetBackendOptions(options map[string]string) error {
+	for key, value := range options {
+		if err := m.SetBackendOption(key, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Set an optional path to a busybox binary to be used in the initrd. If not set,
+// busybox will be looked for in the host's PATH.
+func (m *Machine) SetBusyboxPath(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("failed to stat busybox binary at %q: %w", path, err)
+	}
+	
+	m.busyboxPath = &path
+	return nil
+}
+
 func (m Machine) generateFstab(w *writerhelper.WriterHelper, backend backend) error {
 	fstab := []string{"# Generated fstab file by fakemachine"}
 
@@ -643,33 +781,47 @@ func stripCompressionSuffix(module string) (string, error) {
 	return "", errors.New("module extension/suffix unknown")
 }
 
-func (m *Machine) generateModulesDep(w *writerhelper.WriterHelper, moddir string, modules map[string]bool) error {
+func (m *Machine) generateModulesDep(w *writerhelper.WriterHelper, tgt_moddir string, moddir string, modules map[string]bool) error {
 	output := make([]string, len(modules))
-	release, err := m.backend.KernelRelease()
+	moddir, err := m.backend.ModulePath()
 	if err != nil {
-		return fmt.Errorf("failed to get kernel release: %w", err)
+		return fmt.Errorf("failed to get module path from backend: %w", err)
 	}
 	i := 0
 	for mod := range modules {
-		modpath, err := getModPath(mod, release)
+		modpath, isBuiltin, err := getModPath(mod, moddir)
 		if err != nil {
 			return fmt.Errorf("failed to get path for module %q: %w", mod, err)
+		} else if isBuiltin {
+			// Builtin modules aren't of interest for modules.dep.
+			continue
 		}
-		modpath, err = stripCompressionSuffix(modpath)
+		modpath, err = filepath.Rel(moddir, modpath)
+		if err != nil {
+			return fmt.Errorf("failed to get relative path for module %q: %w", mod, err)
+		}
+		modpath, err = stripCompressionSuffix(path.Join(tgt_moddir, modpath))
 		if err != nil {
 			return fmt.Errorf("failed to strip compression suffix for module %q: %w", mod, err)
 		}
-		deplist, err := getModDepends(mod, release)
+		deplist, err := getModDepends(mod, moddir)
 		if err != nil {
 			return fmt.Errorf("failed to get dependencies for module %q: %w", mod, err)
 		}
 		deps := make([]string, len(deplist))
 		for j, dep := range deplist {
-			deppath, err := getModPath(dep, release)
+			deppath, isBuiltin, err := getModPath(dep, moddir)
 			if err != nil {
 				return fmt.Errorf("failed to get path for dependency %q of module %q: %w", dep, mod, err)
+			} else if isBuiltin {
+				// Builtin modules aren't of interest for modules.dep.
+				continue
 			}
-			deppath, err = stripCompressionSuffix(deppath)
+			deppath, err = filepath.Rel(moddir, deppath)
+			if err != nil {
+				return fmt.Errorf("failed to get relative path for dependency %q of module %q: %w", dep, mod, err)
+			}
+			deppath, err = stripCompressionSuffix(path.Join(tgt_moddir, deppath))
 			if err != nil {
 				return fmt.Errorf("failed to strip compression suffix for dependency %q of module %q: %w", dep, mod, err)
 			}
@@ -679,7 +831,7 @@ func (m *Machine) generateModulesDep(w *writerhelper.WriterHelper, moddir string
 		i++
 	}
 
-	path := path.Join(moddir, "modules.dep")
+	path := path.Join(tgt_moddir, "modules.dep")
 	if err := w.WriteFile(path, strings.Join(output, "\n"), 0644); err != nil {
 		return fmt.Errorf("failed to write modules.dep: %w", err)
 	}
@@ -694,6 +846,20 @@ func (m *Machine) writerKernelModules(w *writerhelper.WriterHelper, moddir strin
 	if len(modules) == 0 {
 		return nil
 	}
+	
+	// Since the user can set a custom module directory via the backend options,
+	// we cannot rely on this directory being in the desired
+	// /usr/lib/modules/$(uname -r) or /lib/modules/$(uname -r) format. Thus,
+	// we construct a static target dir for the initrd from the kernel release.
+	// We keep the original behavior with the /usr prefix for merged-usr systems.
+	kernel_release, err := m.backend.KernelRelease()
+	if err != nil {
+		return fmt.Errorf("failed to get kernel release from backend: %w", err)
+	}
+	tgt_moddir := "/lib/modules/" + kernel_release
+	if m.mergedUsr {
+		tgt_moddir = "/usr" + tgt_moddir
+	}
 
 	modfiles := []string{
 		"modules.builtin",
@@ -701,7 +867,7 @@ func (m *Machine) writerKernelModules(w *writerhelper.WriterHelper, moddir strin
 		"modules.symbols"}
 
 	for _, v := range modfiles {
-		if err := w.CopyFile(moddir + "/" + v); err != nil {
+		if err := w.CopyFileTo(moddir + "/" + v, tgt_moddir + "/" + v); err != nil {
 			return fmt.Errorf("failed to copy kernel module file %s: %w", moddir+"/"+v, err)
 		}
 	}
@@ -709,12 +875,12 @@ func (m *Machine) writerKernelModules(w *writerhelper.WriterHelper, moddir strin
 	copiedModules := make(map[string]bool)
 
 	for _, modname := range modules {
-		if err := m.copyModules(w, modname, copiedModules); err != nil {
+		if err := m.copyModules(w, tgt_moddir, modname, copiedModules); err != nil {
 			return err
 		}
 	}
 
-	return m.generateModulesDep(w, moddir, copiedModules)
+	return m.generateModulesDep(w, tgt_moddir, moddir, copiedModules)
 }
 
 func (m *Machine) setupscratch() error {
@@ -836,12 +1002,19 @@ func (m *Machine) buildInitrd(command string, extracontent [][2]string) (err err
 		prefix = "/usr"
 	}
 
-	// search for busybox; in some distros it's located under /sbin
-	busybox, err := exec.LookPath("busybox")
-	if err != nil {
-		return fmt.Errorf("failed to find busybox: %w", err)
+	var busyboxPath string
+	if m.busyboxPath != nil {
+		// Use the user-provided busybox path
+		busyboxPath = *m.busyboxPath
+	} else {
+		// search for busybox; in some distros it's located under /sbin
+		var err error
+		busyboxPath, err = exec.LookPath("busybox")
+		if err != nil {
+			return fmt.Errorf("failed to find busybox: %w", err)
+		}
 	}
-	err = w.CopyFileTo(busybox, prefix+"/bin/busybox")
+	err = w.CopyFileTo(busyboxPath, prefix+"/bin/busybox")
 	if err != nil {
 		return fmt.Errorf("failed to copy busybox: %w", err)
 	}
@@ -1102,6 +1275,9 @@ func (m *Machine) RunInMachineWithArgs(args []string) (int, error) {
 	command := strings.Join([]string{name, quotedArgs}, " ")
 
 	executable, err := exec.LookPath(os.Args[0])
+
+	fmt.Printf("Executable path: %s\n", executable)
+	fmt.Printf("Name: %s\n", name)
 
 	if err != nil {
 		return -1, fmt.Errorf("failed to find executable: %w", err)

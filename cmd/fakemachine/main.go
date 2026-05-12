@@ -26,6 +26,7 @@ type Options struct {
 	ShowBoot    bool              `long:"show-boot" description:"Show boot/console messages from the fakemachine"`
 	Quiet       bool              `short:"q" long:"quiet" description:"Don't show logs from fakemachine or the backend; only print the command's stdout/stderr"`
 	Version     bool              `long:"version" description:"Print fakemachine version"`
+	BackendOptions map[string]string `long:"backend-option" description:"Backend-specific options (use --backend-option KEY:VALUE syntax)"`
 }
 
 var options Options
@@ -200,6 +201,11 @@ func main() {
 
 	m, err := fakemachine.NewMachineWithBackend(options.Backend)
 	if err != nil {
+		fmt.Printf("fakemachine: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := m.SetBackendOptions(options.BackendOptions); err != nil {
 		fmt.Printf("fakemachine: %v\n", err)
 		os.Exit(1)
 	}

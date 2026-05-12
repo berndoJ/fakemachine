@@ -113,4 +113,7 @@ type backend interface {
 
 	// Start an instance of the backend
 	Start() (bool, error)
+
+	// Set a backend-specific option.
+	SetOption(key string, value string) error
 }

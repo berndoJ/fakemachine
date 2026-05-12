@@ -297,3 +297,47 @@ func TestCommandEscaping(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, exitcode)
 }
+
+func TestSetBackendOptionValid(t *testing.T) {
+	t.Parallel()
+	m := CreateMachine(t)
+
+	err := m.SetBackendOption("kernel-path", "/boot/vmlinuz")
+	require.NoError(t, err)
+}
+
+func TestSetBackendOptionInvalid(t *testing.T) {
+	t.Parallel()
+	m := CreateMachine(t)
+
+	err := m.SetBackendOption("nonexistent-option", "value")
+	require.Error(t, err)
+}
+
+func TestSetBackendOptionsValid(t *testing.T) {
+	t.Parallel()
+	m := CreateMachine(t)
+
+	err := m.SetBackendOptions(map[string]string{
+		"kernel-path": "/boot/vmlinuz",
+	})
+	require.NoError(t, err)
+}
+
+func TestSetBackendOptionsEmpty(t *testing.T) {
+	t.Parallel()
+	m := CreateMachine(t)
+
+	err := m.SetBackendOptions(map[string]string{})
+	require.NoError(t, err)
+}
+
+func TestSetBackendOptionsInvalid(t *testing.T) {
+	t.Parallel()
+	m := CreateMachine(t)
+
+	err := m.SetBackendOptions(map[string]string{
+		"nonexistent-option": "value",
+	})
+	require.Error(t, err)
+}

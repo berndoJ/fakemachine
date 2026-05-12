@@ -15,11 +15,14 @@ import (
 )
 
 type qemuBackend struct {
-	machine *Machine
+	machine        *Machine
+	kernel_path    *string
+	kernel_release *string
+	module_path    *string
 }
 
-func newQemuBackend(m *Machine) qemuBackend {
-	return qemuBackend{machine: m}
+func newQemuBackend(m *Machine) *qemuBackend {
+	return &qemuBackend{machine: m}
 }
 
 func (b qemuBackend) Name() string {
@@ -75,10 +78,17 @@ func (b qemuBackend) QemuPath() (string, error) {
 }
 
 func (b qemuBackend) KernelRelease() (string, error) {
-	/* First try the kernel the current system is running, but if there are no
+	/* If the kernel release option is set, prefer it.
+	 *
+	 * Otherwise, try the kernel the current system is running, but if there are no
 	 * modules for that try the latest from /lib/modules. The former works best
 	 * for systems directly running fakemachine, the latter makes sense in docker
 	 * environments */
+
+	if b.kernel_release != nil {
+		return *b.kernel_release, nil
+	}
+
 	var u unix.Utsname
 	if err := unix.Uname(&u); err != nil {
 		return "", fmt.Errorf("failed to get kernel release: %w", err)
@@ -115,12 +125,22 @@ func (b qemuBackend) KernelRelease() (string, error) {
 }
 
 func (b qemuBackend) KernelPath() (string, error) {
-	/* First we look within the modules directory, as supported by
+	/* If the kernel path option is set, check and prefer that.
+	 *
+	 * Otherwise, we look within the modules directory, as supported by
 	 * various distributions - Arch, Fedora...
 	 *
 	 * ... perhaps because systemd requires it to allow hibernation
 	 * https://github.com/systemd/systemd/commit/edda44605f06a41fb86b7ab8128dcf99161d2344
 	 */
+	if b.kernel_path != nil {
+		_, err := os.Stat(*b.kernel_path)
+		if err != nil {
+			return "", fmt.Errorf("failed to stat kernel path %s: %w", *b.kernel_path, err)
+		}
+		return *b.kernel_path, nil
+	}
+
 	moddir, err := b.ModulePath()
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("failed to get kernel module path: %w", err)
@@ -155,6 +175,14 @@ func (b qemuBackend) KernelPath() (string, error) {
 }
 
 func (b qemuBackend) ModulePath() (string, error) {
+	if b.module_path != nil {
+		_, err := os.Stat(*b.module_path)
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("module directory not found at %s: %w", *b.module_path, err)
+		}
+		return *b.module_path, nil
+	}
+
 	kernelRelease, err := b.KernelRelease()
 	if err != nil {
 		return "", err
@@ -207,7 +235,7 @@ func (b qemuBackend) MountParameters(_ mountPoint) (string, []string) {
 }
 
 func (b qemuBackend) InitModules() []string {
-	return []string{"virtio_pci", "virtio_console", "9pnet_virtio", "9p"}
+	return []string{"virtio_pci", "virtio_console", "9pnet_virtio", "9p", "virtio_net"}
 }
 
 func (b qemuBackend) InitStaticVolumes() []mountPoint {
@@ -216,6 +244,22 @@ func (b qemuBackend) InitStaticVolumes() []mountPoint {
 
 func (b qemuBackend) Start() (bool, error) {
 	return b.StartQemu(false)
+}
+
+func (b *qemuBackend) SetOption(key string, value string) error {
+	switch key {
+	case "kernel-path":
+		b.kernel_path = &value
+		return nil
+	case "kernel-release":
+		b.kernel_release = &value
+		return nil
+	case "module-path":
+		b.module_path = &value
+		return nil
+	default:
+		return fmt.Errorf("unknown option %s for qemu backend", key)
+	}
 }
 
 func (b qemuBackend) StartQemu(kvm bool) (bool, error) {
@@ -234,8 +278,13 @@ func (b qemuBackend) StartQemu(kvm bool) (bool, error) {
 		"-kernel", kernelPath,
 		"-initrd", m.initrdpath,
 		"-display", "none",
+		"-audio", "none",
 		"-nic", "user,model=virtio-net-pci",
 		"-no-reboot"}
+
+	// Copy away initrd for testing to /tmp/initrd.cpio
+	exec.Command("cp", m.initrdpath, "/tmp/initrd.cpio").Run()
+	exec.Command("cp", kernelPath, "/tmp/vmlinuz").Run()
 
 	if kvm {
 		qemuargs = append(qemuargs,
@@ -319,8 +368,8 @@ type kvmBackend struct {
 	qemuBackend
 }
 
-func newKvmBackend(m *Machine) kvmBackend {
-	return kvmBackend{qemuBackend{machine: m}}
+func newKvmBackend(m *Machine) *kvmBackend {
+	return &kvmBackend{qemuBackend{machine: m}}
 }
 
 func (b kvmBackend) Name() string {
