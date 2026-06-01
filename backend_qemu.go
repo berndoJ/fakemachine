@@ -258,8 +258,8 @@ func (b *qemuBackend) SetOption(key string, value string) error {
 	case "module-path":
 		b.module_path = &value
 		return nil
-	case "extra-module":
-		b.extra_modules = append(b.extra_modules, value)
+	case "extra-modules":
+		b.extra_modules = strings.Split(value, ",")
 		return nil
 	default:
 		return fmt.Errorf("unknown option %s for qemu backend", key)
