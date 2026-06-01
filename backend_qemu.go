@@ -235,7 +235,7 @@ func (b qemuBackend) MountParameters(_ mountPoint) (string, []string) {
 }
 
 func (b qemuBackend) InitModules() []string {
-	return []string{"virtio_pci", "virtio_console", "9pnet_virtio", "9p", "virtio_net"}
+	return []string{"virtio_pci", "virtio_console", "9pnet_virtio", "9p", "virtio_net", "virtio_blk"}
 }
 
 func (b qemuBackend) InitStaticVolumes() []mountPoint {
@@ -281,10 +281,6 @@ func (b qemuBackend) StartQemu(kvm bool) (bool, error) {
 		"-audio", "none",
 		"-nic", "user,model=virtio-net-pci",
 		"-no-reboot"}
-
-	// Copy away initrd for testing to /tmp/initrd.cpio
-	exec.Command("cp", m.initrdpath, "/tmp/initrd.cpio").Run()
-	exec.Command("cp", kernelPath, "/tmp/vmlinuz").Run()
 
 	if kvm {
 		qemuargs = append(qemuargs,
