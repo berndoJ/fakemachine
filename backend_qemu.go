@@ -19,6 +19,7 @@ type qemuBackend struct {
 	kernel_path    *string
 	kernel_release *string
 	module_path    *string
+	extra_modules  []string
 }
 
 func newQemuBackend(m *Machine) *qemuBackend {
@@ -235,7 +236,7 @@ func (b qemuBackend) MountParameters(_ mountPoint) (string, []string) {
 }
 
 func (b qemuBackend) InitModules() []string {
-	return []string{"virtio_pci", "virtio_console", "9pnet_virtio", "9p", "virtio_net", "virtio_blk"}
+	return append([]string{"virtio_pci", "virtio_console", "9pnet_virtio", "9p", "virtio_net", "virtio_blk"}, b.extra_modules...)
 }
 
 func (b qemuBackend) InitStaticVolumes() []mountPoint {
@@ -256,6 +257,9 @@ func (b *qemuBackend) SetOption(key string, value string) error {
 		return nil
 	case "module-path":
 		b.module_path = &value
+		return nil
+	case "extra-module":
+		b.extra_modules = append(b.extra_modules, value)
 		return nil
 	default:
 		return fmt.Errorf("unknown option %s for qemu backend", key)
